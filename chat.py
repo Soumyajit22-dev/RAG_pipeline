@@ -1,12 +1,12 @@
 import os
 import sys
+import requests
 from dotenv import load_dotenv
-import anthropic
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 
 from retrieval import get_chroma_collection
-from rag_pipeline import run_query
+from rag_pipeline import run_query, OLLAMA_URL, OLLAMA_MODEL
 
 load_dotenv()
 
@@ -14,7 +14,6 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -68,14 +67,21 @@ def initialize_clients():
         print(f"  Neo4j:    [WARNING] {e} — running in semantic-only mode")
         driver = None
 
-    # Anthropic
-    if not ANTHROPIC_API_KEY:
-        print("  Anthropic: ERROR — ANTHROPIC_API_KEY not set in .env")
-        sys.exit(1)
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    print("  Anthropic: claude-sonnet-4-6 ready")
+    # Ollama
+    try:
+        resp = requests.get(OLLAMA_URL.replace("/api/generate", "/api/tags"), timeout=5)
+        if resp.status_code == 200:
+            models = [m["name"] for m in resp.json().get("models", [])]
+            if any(OLLAMA_MODEL in m for m in models):
+                print(f"  Ollama:   {OLLAMA_MODEL} ready")
+            else:
+                print(f"  Ollama:   WARNING — model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
+        else:
+            print(f"  Ollama:   WARNING — server responded with {resp.status_code}")
+    except Exception:
+        print(f"  Ollama:   WARNING — cannot reach {OLLAMA_URL}. Is Ollama running?")
 
-    return collection, driver, client
+    return collection, driver
 
 
 def print_sources_table(sources: list, pdf_fetched: list):
@@ -101,7 +107,7 @@ def format_timing(result: dict) -> str:
     )
 
 
-def run_chat_loop(collection, driver, client):
+def run_chat_loop(collection, driver):
     print(BANNER)
     history = []  # list of (query, answer) tuples, last 3
 
@@ -145,7 +151,6 @@ def run_chat_loop(collection, driver, client):
                 query=augmented_query,
                 collection=collection,
                 driver=driver,
-                client=client,
                 top_k_retrieve=10,
                 top_k_pdf=5,
                 stream_callback=lambda text: print(text, end="", flush=True),
@@ -165,8 +170,8 @@ def run_chat_loop(collection, driver, client):
 
 
 def main():
-    collection, driver, client = initialize_clients()
-    run_chat_loop(collection, driver, client)
+    collection, driver = initialize_clients()
+    run_chat_loop(collection, driver)
     if driver:
         driver.close()
 

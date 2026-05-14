@@ -1,16 +1,17 @@
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from dotenv import load_dotenv
-import anthropic
+import requests
 
 from retrieval import hybrid_search
 from pdf_processor import get_pdf_text
 
 load_dotenv()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-MODEL = "claude-sonnet-4-6"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 MAX_PDF_CONTEXT_CHARS = 8000
 PDF_FETCH_TIMEOUT = 45  # seconds per PDF
 
@@ -92,8 +93,9 @@ def format_pdf_context(pdf_results: dict, results: list) -> str:
     return "\n\n".join(sections) if sections else "[No PDF text was successfully extracted]"
 
 
-def build_messages(query: str, metadata_ctx: str, pdf_ctx: str) -> list:
-    content = (
+def build_prompt(query: str, metadata_ctx: str, pdf_ctx: str) -> str:
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
         "<metadata_search_results>\n"
         f"{metadata_ctx}\n"
         "</metadata_search_results>\n\n"
@@ -102,38 +104,39 @@ def build_messages(query: str, metadata_ctx: str, pdf_ctx: str) -> list:
         "</pdf_text_extracts>\n\n"
         f"User question: {query}"
     )
-    return [{"role": "user", "content": content}]
 
 
-def call_llm(client: anthropic.Anthropic, messages: list, stream_callback=None) -> str:
-    for attempt in range(3):
-        try:
-            full_text = ""
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    full_text += text
-                    if stream_callback:
-                        stream_callback(text)
-            return full_text
-        except anthropic.RateLimitError:
-            if attempt < 2:
-                time.sleep(60)
-            else:
-                raise
-        except anthropic.APIError:
-            raise
+def call_llm(prompt: str, stream_callback=None) -> str:
+    full_text = ""
+    try:
+        resp = requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True},
+            stream=True,
+            timeout=300,
+        )
+        if resp.status_code != 200:
+            return f"[LLM error: HTTP {resp.status_code}]"
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            token = chunk.get("response", "")
+            if token:
+                full_text += token
+                if stream_callback:
+                    stream_callback(token)
+            if chunk.get("done"):
+                break
+    except Exception as e:
+        return f"[LLM error: {e}]"
+    return full_text
 
 
 def run_query(
     query: str,
     collection,
     driver,
-    client: anthropic.Anthropic,
     top_k_retrieve: int = 10,
     top_k_pdf: int = 5,
     stream_callback=None,
@@ -178,8 +181,8 @@ def run_query(
     t2 = time.time()
     metadata_ctx = format_metadata_context(results)
     pdf_ctx = format_pdf_context(pdf_results, results)
-    messages = build_messages(query, metadata_ctx, pdf_ctx)
-    answer = call_llm(client, messages, stream_callback=stream_callback)
+    prompt = build_prompt(query, metadata_ctx, pdf_ctx)
+    answer = call_llm(prompt, stream_callback=stream_callback)
     llm_time = time.time() - t2
 
     return {
